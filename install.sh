@@ -5,12 +5,12 @@ set -euo pipefail
 # User-configurable values
 # =========================
 DISK="${DISK:-/dev/sda}"
-HOSTNAME="${HOSTNAME:-arch}"
+HOSTNAME="${HOSTNAME:-archvm}"
 USERNAME="${USERNAME:-user}"
 USER_PASSWORD="${USER_PASSWORD:-changeme}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-rootchangeme}"
 TIMEZONE="${TIMEZONE:-Europe/Dublin}"
-EFI_SIZE_MIB="${EFI_SIZE_MIB:-1024}"
+EFI_SIZE="${EFI_SIZE:-1GiB}"
 
 # =========================
 # Safety checks
@@ -22,16 +22,18 @@ fi
 
 if [[ ! -b "$DISK" ]]; then
   echo "Disk $DISK does not exist."
+  lsblk
   exit 1
 fi
 
 if [[ ! -d /sys/firmware/efi/efivars ]]; then
-  echo "This script assumes a UEFI booted installer."
+  echo "This script assumes the Arch ISO was booted in UEFI mode."
+  echo "In VirtualBox, enable EFI and boot the ISO again."
   exit 1
 fi
 
-echo "About to WIPE and install Arch Linux on: $DISK"
-sleep 3
+echo "About to ERASE and install Arch Linux on $DISK"
+sleep 5
 
 # =========================
 # Time sync
@@ -41,27 +43,44 @@ timedatectl set-ntp true
 # =========================
 # Partitioning
 # Layout:
-# 1: EFI
-# 2: root
+#   1 = EFI
+#   2 = root
 # =========================
+umount -R /mnt 2>/dev/null || true
+swapoff -a 2>/dev/null || true
+
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
-
 partprobe "$DISK" || true
-
-sgdisk -n 1:1MiB:"${EFI_SIZE_MIB}MiB" -t 1:ef00 -c 1:"EFI" "$DISK"
-sgdisk -n 2:"${EFI_SIZE_MIB}MiB":0 -t 2:8300 -c 2:"root" "$DISK"
-
-partprobe "$DISK"
 udevadm settle
 
-# Handle nvme/mmcblk naming
+# Fresh GPT
+sgdisk -o "$DISK"
+
+# EFI partition
+sgdisk -n 1:1MiB:+"$EFI_SIZE" -t 1:ef00 -c 1:"EFI" "$DISK"
+
+# Root partition: use remaining usable space automatically
+sgdisk -N 2 -t 2:8300 -c 2:"root" "$DISK"
+
+partprobe "$DISK" || true
+udevadm settle
+sleep 2
+
+# Handle naming for SATA vs NVMe/MMC
 if [[ "$DISK" =~ nvme|mmcblk ]]; then
   EFI_PART="${DISK}p1"
   ROOT_PART="${DISK}p2"
 else
   EFI_PART="${DISK}1"
   ROOT_PART="${DISK}2"
+fi
+
+# Sanity check
+if [[ ! -b "$EFI_PART" || ! -b "$ROOT_PART" ]]; then
+  echo "Partition devices not found."
+  lsblk
+  exit 1
 fi
 
 # =========================
@@ -75,7 +94,7 @@ mkdir -p /mnt/boot
 mount "$EFI_PART" /mnt/boot
 
 # =========================
-# Base install
+# Base system install
 # =========================
 pacstrap -K /mnt \
   base \
@@ -83,25 +102,23 @@ pacstrap -K /mnt \
   linux \
   linux-headers \
   linux-firmware \
-  networkmanager \
   grub \
   efibootmgr \
+  networkmanager \
   sudo \
   nano \
   vim \
   git \
-  wget \
   curl \
+  wget \
   man-db \
   man-pages \
   texinfo \
-  reflector \
-  os-prober \
   dosfstools \
   mtools \
+  bash-completion \
   xdg-user-dirs \
   xdg-utils \
-  bash-completion \
   pipewire \
   pipewire-alsa \
   pipewire-audio \
@@ -117,21 +134,20 @@ pacstrap -K /mnt \
   kde-applications-meta \
   sddm \
   xorg \
-  xorg-xinit \
   xorg-server \
-  virtualbox \
-  virtualbox-host-modules-arch \
+  xorg-xinit \
+  virtualbox-guest-utils \
   virtualbox-guest-iso
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
 # =========================
-# Chroot configuration
+# System configuration
 # =========================
 arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
 
-# Timezone and clock
+# Time
 ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc
 
@@ -139,7 +155,7 @@ hwclock --systohc
 sed -i 's/^#\\s*en_IE.UTF-8 UTF-8/en_IE.UTF-8 UTF-8/' /etc/locale.gen
 locale-gen
 
-# NixOS-like locale settings
+# Locale settings matching your NixOS config
 cat > /etc/locale.conf <<LOCALECONF
 LANG=en_IE.UTF-8
 LC_ADDRESS=en_IE.UTF-8
@@ -158,7 +174,16 @@ cat > /etc/vconsole.conf <<VCONSOLE
 KEYMAP=ie
 VCONSOLE
 
+# Hostname and hosts
+echo "${HOSTNAME}" > /etc/hostname
+cat > /etc/hosts <<HOSTS
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
+
 # zram swap
+mkdir -p /etc/systemd
 cat > /etc/systemd/zram-generator.conf <<ZRAMCONF
 [zram0]
 zram-size = ram / 2
@@ -167,57 +192,53 @@ swap-priority = 100
 fs-type = swap
 ZRAMCONF
 
-# Hostname
-echo "${HOSTNAME}" > /etc/hostname
-
-cat > /etc/hosts <<HOSTS
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
-HOSTS
-
 # Root password
 echo "root:${ROOT_PASSWORD}" | chpasswd
 
-# User creation
-useradd -m -G wheel,vboxusers -s /bin/bash "${USERNAME}"
+# User
+useradd -m -G wheel -s /bin/bash "${USERNAME}"
 echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
 
-# Sudo for wheel
+# Sudo
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# Keyboard
+# Optional localectl setup
+localectl set-locale LANG=en_IE.UTF-8 || true
 localectl set-keymap ie || true
 
 # Services
 systemctl enable NetworkManager
 systemctl enable sddm
+systemctl enable vboxservice
 
 # Initramfs
 mkinitcpio -P
 
-# Bootloader
+# GRUB
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Arch
 grub-mkconfig -o /boot/grub/grub.cfg
+EOF
 
-# Build paru as normal user
-sudo -u "${USERNAME}" bash <<PARUUSER
-set -euo pipefail
-cd /home/${USERNAME}
+# =========================
+# Install paru and Google Chrome
+# Done after the main chroot setup
+# =========================
+arch-chroot /mnt /bin/bash -c "su - ${USERNAME} -c '
+set -e
+cd ~
 git clone https://aur.archlinux.org/paru.git
 cd paru
 makepkg -si --noconfirm
-PARUUSER
+'"
 
-# Install Google Chrome from AUR
-sudo -u "${USERNAME}" bash <<CHROMEUSER
-set -euo pipefail
+arch-chroot /mnt /bin/bash -c "su - ${USERNAME} -c '
+set -e
 paru -S --noconfirm google-chrome
-CHROMEUSER
-EOF
+'"
 
 echo
 echo "Install complete."
+echo
 echo "Now run:"
 echo "  umount -R /mnt"
 echo "  reboot"
